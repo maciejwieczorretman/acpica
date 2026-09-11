@@ -1174,17 +1174,6 @@ AcpiDmDumpTable (
                             ACPI_CAST_PTR (char, Target));
             break;
 
-        case ACPI_DMT_MISC_DATA:
-            /*
-             * Calculate the length of the vendor data for the MISC table:
-             * Length = (Current Subtable ptr + EntryLength) -
-             *          Start of the vendor data (Target)
-             */
-            ByteLength = ((ACPI_CAST_PTR (char, Table) +
-                            (ACPI_CAST_PTR (ACPI_MISC_GUID_ENTRY, Table)->EntryLength)) -
-                            ACPI_CAST_PTR (char, Target));
-            break;
-
         case ACPI_DMT_STRING:
 
             ByteLength = strlen (ACPI_CAST_PTR (char, Target)) + 1;
@@ -1949,7 +1938,6 @@ AcpiDmDumpTable (
         case ACPI_DMT_RAW_BUFFER:
         case ACPI_DMT_BUFFER:
         case ACPI_DMT_PMTT_VENDOR:
-        case ACPI_DMT_MISC_DATA:
 
             if (ByteLength == 0)
             {

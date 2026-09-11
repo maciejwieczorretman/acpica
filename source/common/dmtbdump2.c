@@ -1244,17 +1244,32 @@ AcpiDmDumpMisc (
 
         AcpiOsPrintf ("\n");
         Status = AcpiDmDumpTable (Table->Length, Offset, Subtable,
-            sizeof (UINT8) * 16 + sizeof (UINT32) * 3, AcpiDmTableInfoMisc0);
+            ACPI_OFFSET (ACPI_MISC_GUID_ENTRY, Data), AcpiDmTableInfoMisc0);
         if (ACPI_FAILURE (Status))
         {
             return;
         }
 
         SubtableLength = Subtable->EntryLength;
-        if (SubtableLength < (sizeof (UINT8) * 16 + sizeof (UINT32) * 3))
+        if (SubtableLength < ACPI_OFFSET (ACPI_MISC_GUID_ENTRY, Data))
         {
             AcpiOsPrintf ("Invalid EntryLength: 0x%X\n", SubtableLength);
             return;
+        }
+
+        /* Optional vendor data, present only if the entry is long enough */
+
+        if (SubtableLength > ACPI_OFFSET (ACPI_MISC_GUID_ENTRY, Data))
+        {
+            Status = AcpiDmDumpTable (Table->Length,
+                Offset + ACPI_OFFSET (ACPI_MISC_GUID_ENTRY, Data),
+                Subtable->Data,
+                SubtableLength - ACPI_OFFSET (ACPI_MISC_GUID_ENTRY, Data),
+                AcpiDmTableInfoMisc0Data);
+            if (ACPI_FAILURE (Status))
+            {
+                return;
+            }
         }
 
         Offset += SubtableLength;

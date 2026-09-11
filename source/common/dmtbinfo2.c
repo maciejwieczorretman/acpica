@@ -1184,7 +1184,14 @@ ACPI_DMTABLE_INFO           AcpiDmTableInfoMisc0[] =
     {ACPI_DMT_UINT32,   ACPI_MISC0_OFFSET (EntryLength),           "Entry Length", 0},
     {ACPI_DMT_UINT32,   ACPI_MISC0_OFFSET (Revision),              "Revision", 0},
     {ACPI_DMT_UINT32,   ACPI_MISC0_OFFSET (ProducerId),            "Producer ID", 0},
-    {ACPI_DMT_MISC_DATA, ACPI_MISC0_OFFSET (Data),                 "Vendor Data", 0},
+    ACPI_DMT_TERMINATOR
+};
+
+/* Optional vendor data field */
+
+ACPI_DMTABLE_INFO           AcpiDmTableInfoMisc0Data[] =
+{
+    {ACPI_DMT_RAW_BUFFER, 0,                                       "Vendor Data", DT_OPTIONAL},
     ACPI_DMT_TERMINATOR
 };
 

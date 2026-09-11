@@ -413,6 +413,26 @@ DtCompileMisc (
         }
 
         DtInsertSubtable (ParentTable, Subtable);
+
+        /* Optional vendor data - the entry may carry no data at all */
+
+        Status = DtCompileTable (PFieldList, AcpiDmTableInfoMisc0Data,
+            &Subtable);
+        if (Status == AE_END_OF_TABLE)
+        {
+            /* The optional field was absent and this was the last entry */
+
+            break;
+        }
+        else if (ACPI_FAILURE (Status))
+        {
+            return (Status);
+        }
+
+        if (Subtable)
+        {
+            DtInsertSubtable (ParentTable, Subtable);
+        }
     }
 
     return (AE_OK);
