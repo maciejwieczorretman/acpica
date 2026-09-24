@@ -34,13 +34,34 @@
 #         subject prefix, a "Link:" to the original ACPICA commit and a
 #         "Signed-off-by:" trailer are added automatically.
 #
-#         When a converted change does not apply cleanly, the action taken is
-#         determined by the conflict policy (-c):
+#         When a converted change does not apply cleanly, both sides are left
+#         inline in the destination file the way "git merge" leaves them - a
+#         3-way merge between the kernel file, the ACPICA file before the commit
+#         and the ACPICA file after it:
+#
+#             <<<<<<< HEAD
+#             the kernel's version
+#             =======
+#             the ACPICA version
+#             >>>>>>> ACPICA <sha>
+#
+#         Everything in the change that does not overlap still lands, so only
+#         the real disagreements have to be looked at. The markers are written
+#         in whatever style the kernel repo's merge.conflictStyle asks for, so
+#         they are the same ones git mergetool and every editor already know.
+#
+#         The run then pauses and waits: the commit is not created until the
+#         markers are gone from the files, because a commit containing them
+#         would not even build. Resolve them in the kernel tree with any editor,
+#         then answer the prompt; if any marker is still there the prompt says
+#         where and asks again.
+#
+#         The action taken on a conflict is determined by the conflict policy
+#         (-c):
 #           ask    - the default; ask on the terminal, offering the same
 #                    choices as an interactive git rebase:
-#                      continue - force-apply the change, then pause to let
-#                                 the rejected hunks be resolved manually
-#                                 (e.g. in another shell), then resume;
+#                      continue - merge the change with conflict markers, then
+#                                 wait for them to be resolved by hand;
 #                      skip     - discard this commit's partial changes and
 #                                 move on;
 #                      abort    - restore the kernel repo to its original
@@ -51,9 +72,11 @@
 #                                 the branch and every commit already ported;
 #                                 resume the rest later with -r.
 #           abort  - non-interactive; behave as the "abort" answer above.
-#           force  - non-interactive; behave as the "continue" answer above,
-#                    committing the partial change. Rejected hunks are
-#                    reported on stderr and in the log before being removed.
+#           force  - non-interactive; merge with conflict markers as above, but
+#                    with nobody to wait for, commit them as they are. The
+#                    markers are reported on stderr and in the log, and the run
+#                    ends with status 3: such a commit does not build and has to
+#                    be fixed up by hand afterwards.
 #         "skip" and "pause" are deliberately not available as -c values:
 #         silently dropping commits, or stopping half-way, are decisions for a
 #         human at the prompt, not defaults for an unattended run.
@@ -62,9 +85,13 @@
 #         carries progress and the final summary. A transcript of the run,
 #         including git and patch output, is appended to the log file (-l).
 #
-#         No patch artifacts (*.rej, *.orig) are left behind: every reject
-#         created by the script is reported and then removed, including on
-#         abort, failure or interruption.
+#         No patch artifacts (*.rej, *.orig) are ever created: a failed change
+#         becomes conflict markers in the file instead, and those are either
+#         resolved before the commit or removed by the reset that an abort,
+#         skip, pause or interruption performs. Stopping without discarding -
+#         'pause', Ctrl-C, or an unexpected failure - copies each conflicted file
+#         next to the log file first, since that reset would otherwise throw away
+#         the only copy of a half-finished resolution.
 #
 #         Parameters:
 #         -d      Path to Linux kernel tree, to port into
@@ -83,8 +110,8 @@
 #         0     All commits in the range were handled cleanly
 #         1     Usage error
 #         2     Environment or precondition failure (nothing was modified)
-#         3     Finished, but at least one commit was skipped, committed with
-#               rejected hunks, or failed to commit - needs human attention
+#         3     Finished, but at least one commit was skipped, needed a conflict
+#               resolved, or failed to commit - needs human attention
 #         4     Aborted on conflict; the kernel repo was restored
 #         5     Paused at a conflict ('p' answer); the branch and the commits
 #               already ported were kept, so the run can be resumed with -r
@@ -102,7 +129,7 @@ CONFLICT_POLICY="ask"
 LOG_FILE=""
 SERIE_CNTR=0
 SKIPPED_CNTR=0
-PARTIAL_CNTR=0
+CONFLICTED_CNTR=0
 FAILED_CNTR=0
 PREFIX="ACPICA"
 TOOL_DIR=$(dirname "$(realpath "$0")")
@@ -118,7 +145,16 @@ KERNEL_TOUCHED=0
 RESUME_BASE=""
 TTY_OK=0
 LAST_PORTED=""
-declare -a REJECT_FILES=()
+# Files this run left with conflict markers, for the commit being ported.
+declare -a CONFLICT_FILES=()
+# Extra 'git merge-file' flags, so the markers match what a real merge in the
+# kernel repo would produce. Filled in once the kernel tree is known.
+declare -a CONFLICT_STYLE_OPT=()
+# What a merge leaves behind, anchored and exact: a marker line is seven <, =, >
+# or | characters, then either end of line or a label. Nothing in the ACPICA or
+# kernel sources looks like that, so source text can never be mistaken for a
+# marker - and a half-finished resolution is still caught.
+CONFLICT_MARKER_RE='^(<<<<<<<|=======|>>>>>>>|\|\|\|\|\|\|\|)( |$)'
 
 # Exit codes
 EXIT_OK=0
@@ -145,6 +181,10 @@ Options:
   -f    Proceed even if the kernel tree has uncommitted changes
   -r    Resume: continue onto <branch_name> if it already exists
   -h    This help message
+
+A change that does not apply cleanly is merged with git-style conflict markers
+(<<<<<<< HEAD / ======= / >>>>>>> ACPICA <sha>) left in the kernel file, and the
+run then waits for them to be resolved by hand before committing.
 
 Exit status: 0 clean, 1 usage, 2 environment, 3 needs attention, 4 aborted,
              5 paused (resume with -r)
@@ -323,6 +363,13 @@ if [[ -z "${SOB_NAME}" || -z "${SOB_EMAIL}" ]]; then
 fi
 SIGNED_OFF_BY="Signed-off-by: ${SOB_NAME} <${SOB_EMAIL}>"
 
+# Write conflicts the way a real merge in this kernel tree would write them, so
+# whatever the user already uses to resolve them keeps working unchanged.
+case "$(git -C "${KERNEL_DIR}" config merge.conflictStyle 2>/dev/null)" in
+  diff3 )  CONFLICT_STYLE_OPT=(--diff3)  ;;
+  zdiff3 ) CONFLICT_STYLE_OPT=(--zdiff3) ;;
+esac
+
 # --- Conflict prompt -----------------------------------------------------
 # Open the terminal once, for the whole run. The probe runs in a subshell on
 # purpose: 'exec' is a special builtin, so a failing redirection here would
@@ -371,31 +418,146 @@ ask_conflict() {
   done
 }
 
-# --- Patch artifact bookkeeping ------------------------------------------
-# Rejects are tracked by exact path, so cleanup never has to sweep the kernel
-# tree and can never delete a *.rej/*.orig that the script did not create.
-record_rejects() {
-  local dir="$1" name="$2" f line
-  for f in "${dir}/${name}.rej" "${dir}/${name}.orig"; do
+# --- Conflict bookkeeping ------------------------------------------------
+# A conflict lives in the destination file itself, as markers, so there is
+# nothing to clean up separately: the reset that abort, skip, pause and
+# interruption already perform takes the markers with it. Only the list of
+# affected files is tracked, so the prompt can name them and re-check them.
+
+# Leave both sides of a change that would not apply inline in the destination,
+# the way "git merge" does: a 3-way merge of the kernel file (ours) against the
+# ACPICA file before (base) and after (theirs) the commit. Parts of the change
+# that do not overlap still land; only genuine disagreements get markers.
+#
+# The merge runs on a copy and is moved into place only once it has succeeded,
+# so a failure inside git merge-file cannot leave the destination half-written.
+# The copy back is a redirect rather than a rename to keep the destination's
+# own inode, mode and ownership.
+#
+# Returns 0 if the file merged cleanly after all, 1 if it was left with conflict
+# markers, 2 if the merge could not be performed at all.
+merge_conflict_inline() {
+  local dest="$1" base="$2" theirs="$3" ours_label="$4" base_label="$5" \
+        theirs_label="$6"
+  local merged rc
+
+  merged="$(mktemp -p "${TMP_WORK}" merged_XXXXXX)" || return 2
+
+  # A destination that does not exist yet (-a, new file) merges against nothing.
+  if [[ -f "${dest}" ]] && ! cat -- "${dest}" > "${merged}" 2>/dev/null; then
+    rm -f "${merged}" >/dev/null 2>&1 || true
+    return 2
+  fi
+
+  git merge-file "${CONFLICT_STYLE_OPT[@]}" \
+    -L "${ours_label}" -L "${base_label}" -L "${theirs_label}" \
+    "${merged}" "${base}" "${theirs}" >> "${LOG_FILE}" 2>&1
+  rc=$?
+
+  # git merge-file returns the number of conflicts, clamped to 127; anything
+  # above that is an internal failure or a signal, not a merge result.
+  if (( rc > 127 )) || ! cat -- "${merged}" > "${dest}" 2>/dev/null; then
+    rm -f "${merged}" >/dev/null 2>&1 || true
+    return 2
+  fi
+
+  rm -f "${merged}" >/dev/null 2>&1 || true
+  (( rc == 0 )) && return 0
+  return 1
+}
+
+# Note a file that came out of the merge with markers, and show where they are.
+record_conflict() {
+  local dest="$1" line
+  CONFLICT_FILES+=("${dest}")
+  warn "conflict left inline in ${dest}:"
+  while IFS= read -r line; do
+    printf '  | %s\n' "${line}" >&2
+    log "  | ${line}"
+  done < <(grep -nE "${CONFLICT_MARKER_RE}" -- "${dest}" 2>/dev/null)
+}
+
+# Every marker still present in this commit's conflicted files, as
+# 'file:line: marker'. Empty output means everything has been resolved.
+unresolved_conflicts() {
+  local f
+  [[ "${#CONFLICT_FILES[@]}" -gt 0 ]] || return 0
+  for f in "${CONFLICT_FILES[@]}"; do
     [[ -f "${f}" ]] || continue
-    REJECT_FILES+=("${f}")
-    [[ "${f}" == *.rej ]] || continue
-    warn "rejected hunks left in ${f}:"
-    while IFS= read -r line; do
-      printf '  | %s\n' "${line}" >&2
-      log "  | ${line}"
-    done < "${f}"
+    grep -HnE "${CONFLICT_MARKER_RE}" -- "${f}" 2>/dev/null
+  done
+  return 0
+}
+
+# 'pause' resets the working tree, and the merged file is the only place the
+# conflict exists - so keep a copy next to the log file, which lives outside
+# both repositories, before it is thrown away.
+save_conflicts_aside() {
+  local f base saved dir
+  [[ "${#CONFLICT_FILES[@]}" -gt 0 ]] || return 0
+  dir="$(dirname -- "${LOG_FILE}")"
+  for f in "${CONFLICT_FILES[@]}"; do
+    [[ -f "${f}" ]] || continue
+    base="$(basename -- "${f}")"
+    saved="${dir}/port_commits-${BRANCH_NAME}-${CMT_SHORT}-${base}.conflict"
+    if cp -- "${f}" "${saved}" 2>/dev/null; then
+      warn "saved the conflicted ${base} as ${saved}"
+      log "saved conflicted ${f} as ${saved}"
+    else
+      # Nowhere else to put it; the log is at least guaranteed to be writable.
+      warn "could not save ${base} aside; its contents are in ${LOG_FILE}"
+      log "--- ${f} with conflict markers (commit ${CMT}) ---"
+      log "$(cat -- "${f}")"
+      log "--- end of ${f} ---"
+    fi
   done
 }
 
-delete_rejects() {
-  local f
-  if [[ "${#REJECT_FILES[@]}" -gt 0 ]]; then
-    for f in "${REJECT_FILES[@]}"; do
-      rm -f "${f}" >/dev/null 2>&1 || true
-    done
-  fi
-  REJECT_FILES=()
+# Wait for the conflict markers left in the current commit's files to be
+# resolved, then stage the result. The commit is held back until every marker is
+# gone: a commit containing them would not build, which is worse than the .rej
+# files this replaced.
+#
+# The check is redone on every 'c', so the files can be edited in another shell,
+# in an editor, or with git mergetool, and the prompt answered as many times as
+# it takes. Only valid under -c ask: the loop relies on a human being able to
+# give a different answer, and -c force/-c abort decide before ever getting here.
+#
+# Sets SKIP_COMMIT on 'skip'; exits the script on 'abort' and 'pause'.
+wait_for_resolution() {
+  local remaining line prompt
+
+  prompt="$(printf 'Commit %s left conflict markers in:\n%s\nResolve them in %s, then answer.' \
+            "${CMT_SHORT}" "$(printf '  %s\n' "${CONFLICT_FILES[@]}")" "${KERNEL_DIR}")"
+
+  while true; do
+    case "$(ask_conflict "${prompt}")" in
+      continue )
+        remaining="$(unresolved_conflicts)"
+        if [[ -n "${remaining}" ]]; then
+          warn "conflict markers are still in place:"
+          while IFS= read -r line; do
+            printf '  | %s\n' "${line}" >&2
+            log "  | ${line}"
+          done <<< "${remaining}"
+          warn "resolve them and answer 'c' again, or choose s, a or p."
+          continue
+        fi
+        info "Conflicts resolved; continuing."
+        CONFLICT_FILES=()
+        git add -u >> "${LOG_FILE}" 2>&1 || true
+        return 0 ;;
+      skip )
+        SKIP_COMMIT=1
+        return 0 ;;
+      abort )
+        abort_port
+        exit ${EXIT_ABORTED} ;;
+      pause )
+        # pause_port resets the tree, but saves the conflicted files aside first.
+        pause_port "commit ${CMT_SHORT}, conflict markers left unresolved" ;;
+    esac
+  done
 }
 
 TMP_ACPICA="$(mktemp -d "${TMPDIR:-/tmp}/acpica_port_commits_XXXXXXXX")" || {
@@ -406,10 +568,9 @@ TMP_ACPICA="$(mktemp -d "${TMPDIR:-/tmp}/acpica_port_commits_XXXXXXXX")" || {
 # (created after the clone below, since the clone target must be empty).
 TMP_WORK="${TMP_ACPICA}/.port_commits_tmp"
 
-# From now on, if anything goes wrong, delete the temporary working directory,
-# the temporary working files and any patch artifacts we created.
+# From now on, if anything goes wrong, delete the temporary working directory
+# and the temporary working files we created.
 cleanup() {
-  delete_rejects
   rm -rf "${TMP_ACPICA}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -417,9 +578,11 @@ trap cleanup EXIT
 # Restore kernel repo in case of abort: back to the original branch, with the
 # branch we created removed. A branch that existed before this run is rewound to
 # where we found it instead - resuming must not destroy somebody else's work.
+# Asking to abort is asking to throw the work away, so conflicted files are not
+# preserved here the way unwind_incomplete preserves them.
 abort_port() {
   warn "aborting: restoring kernel repo to its state before porting."
-  delete_rejects
+  CONFLICT_FILES=()
   cd "${KERNEL_DIR}" || return 0
   git reset --hard "${RESUME_BASE:-HEAD}" >/dev/null 2>&1 || true
   git checkout -- . >/dev/null 2>&1 || true
@@ -437,7 +600,10 @@ abort_port() {
 # commit, but keep the branch and the commits that were ported successfully -
 # unlike an explicit abort, this is not a request to throw work away.
 unwind_incomplete() {
-  delete_rejects
+  # The reset below removes the conflict markers along with everything else, and
+  # a half-finished resolution is real work - keep a copy of it first.
+  save_conflicts_aside
+  CONFLICT_FILES=()
   cd "${KERNEL_DIR}" 2>/dev/null || return 0
   git reset --hard >/dev/null 2>&1 || true
   warn "kept branch '${BRANCH_NAME}' with ${SERIE_CNTR} commit(s) ported by this run; working tree reset."
@@ -501,9 +667,9 @@ on_signal() {
 trap 'on_signal INT' INT
 trap 'on_signal TERM' TERM
 
-# Discard any partial changes from the current commit and clean up leftovers.
+# Discard any partial changes from the current commit, conflict markers included.
 skip_current_commit() {
-  delete_rejects
+  CONFLICT_FILES=()
   cd "${KERNEL_DIR}" || return 0
   git reset --hard >/dev/null 2>&1 || true
 }
@@ -594,9 +760,11 @@ done < <(
 )
 
 for CMT in "${COMMITS[@]}"; do
-  ANYTHING_REJECTED=0
+  ANYTHING_CONFLICTED=0
+  CONFLICTS_COMMITTED=0
   ANYTHING_TO_ADD=0
   SKIP_COMMIT=0
+  CONFLICT_FILES=()
 
   cd "${TMP_ACPICA}" || die ${EXIT_ENV} "cannot enter ${TMP_ACPICA}."
   info "Processing commit ${CMT} from ACPICA:"
@@ -751,15 +919,42 @@ for CMT in "${COMMITS[@]}"; do
         # to the log, that prompt is invisible and the run appears to hang; with
         # no terminal it instead takes the default and silently skips the hunk.
         # -f turns both cases into an ordinary failed hunk we already handle.
-        if patch -l -F 3 -f --dry-run -d "${DEST_DIR}" "$FILE_NAME" <<< "$DIFF_RESULT" >> "${LOG_FILE}" 2>&1; then
-            patch -l -F 3 -f -d "${DEST_DIR}" "$FILE_NAME" <<< "$DIFF_RESULT" >> "${LOG_FILE}" 2>&1
+        #
+        # --no-backup-if-mismatch and '-r -' keep the kernel tree free of patch
+        # artifacts: by default patch(1) saves a .orig copy whenever a hunk
+        # applies with fuzz or at an offset (which -F 3 invites), and writes a
+        # .rej for every hunk it drops. Neither is wanted here - a conflict is
+        # reported and re-done as a 3-way merge below, so the rejects are
+        # redundant, and the leftovers would show up as untracked files in the
+        # commit that follows.
+        if patch -l -F 3 -f --no-backup-if-mismatch -r - --dry-run -d "${DEST_DIR}" "$FILE_NAME" <<< "$DIFF_RESULT" >> "${LOG_FILE}" 2>&1; then
+            patch -l -F 3 -f --no-backup-if-mismatch -r - -d "${DEST_DIR}" "$FILE_NAME" <<< "$DIFF_RESULT" >> "${LOG_FILE}" 2>&1
         else
             case "$(ask_conflict "Conflict: patch does not apply cleanly to ${DEST}.")" in
                 continue )
-                    warn "conflict: forcing the patch into ${DEST}."
-                    patch -l -F 3 -f -d "${DEST_DIR}" "$FILE_NAME" <<< "$DIFF_RESULT" >> "${LOG_FILE}" 2>&1 || true
-                    record_rejects "${DEST_DIR}" "${FILE_NAME}"
-                    ANYTHING_REJECTED=1
+                    # Redo the change as a 3-way merge instead of forcing the
+                    # patch: what does not overlap still lands, and what does is
+                    # left in the file as ordinary git conflict markers rather
+                    # than siphoned off into a .rej nobody reads. This merges the
+                    # whole file, so it can also pick up differences the diff
+                    # above ignores (-E -p -B -b) - which is the point, since
+                    # this file is about to be looked at by hand anyway.
+                    warn "conflict: merging ${DEST} with conflict markers."
+                    merge_conflict_inline "${DEST}" "${TMP_PARENT}" "${TMP_CURRENT}" \
+                        "HEAD" "ACPICA ${CMT:0:12}^" "ACPICA ${CMT:0:12}"
+                    case $? in
+                        0 )
+                            info "3-way merge applied ${DEST} cleanly after all." ;;
+                        1 )
+                            record_conflict "${DEST}"
+                            ANYTHING_CONFLICTED=1 ;;
+                        * )
+                            # The merge never touched the destination, so nothing
+                            # is half-applied; hand the whole commit back rather
+                            # than committing a change with a hole in it.
+                            warn "could not merge ${DEST} (see ${LOG_FILE}); skipping commit ${CMT}."
+                            SKIP_COMMIT=1 ;;
+                    esac
                     ;;
                 skip )
                     warn "conflict in ${DEST}: skipping commit ${CMT}."
@@ -770,7 +965,7 @@ for CMT in "${COMMITS[@]}"; do
                     abort_port
                     exit ${EXIT_ABORTED} ;;
                 pause )
-                    # The dry run created no .rej, so the failed patch exists
+                    # Nothing was merged, so the change that failed exists
                     # nowhere on disk. Keep it in the log - which lives outside
                     # both repos - so the manual port has something to work from.
                     # Rewrite the diff headers, which name temporary files that
@@ -801,27 +996,22 @@ for CMT in "${COMMITS[@]}"; do
       || die ${EXIT_ENV} "git add failed for ${DEST}; see ${LOG_FILE}."
   done
 
-  # If 'continue' was chosen on a conflict, pause so the user can resolve the
-  # rejected hunks manually. Only reachable under -c ask and -c force.
-  if [[ "${SKIP_COMMIT}" == 0 && "${ANYTHING_REJECTED}" != 0 ]]; then
+  # At least one file came out of the merge with conflict markers. Wait here
+  # until they are gone: committing them would produce a commit that does not
+  # build. Only reachable under -c ask and -c force.
+  if [[ "${SKIP_COMMIT}" == 0 && "${ANYTHING_CONFLICTED}" != 0 ]]; then
     cd "${KERNEL_DIR}" || die ${EXIT_ENV} "cannot enter ${KERNEL_DIR}."
-    case "$(ask_conflict "Commit ${CMT_SHORT} left rejected hunks (listed above); resolve them now if needed.")" in
-      continue )
-        info "Continuing..."
-        # Whatever was resolved by hand is staged below; the reject files
-        # themselves must not survive into the commit or the tree.
-        delete_rejects
-        git add -u >> "${LOG_FILE}" 2>&1 || true ;;
-      skip )
-        SKIP_COMMIT=1 ;;
-      abort )
-        abort_port
-        exit ${EXIT_ABORTED} ;;
-      pause )
-        # The rejected hunks were already printed in full by record_rejects, so
-        # the information survives the reset that pause_port performs.
-        pause_port "commit ${CMT_SHORT}, rejected hunks left unresolved" ;;
-    esac
+    if [[ "${CONFLICT_POLICY}" == "ask" ]]; then
+      wait_for_resolution
+    else
+      # -c force: there is nobody to wait for, so the markers go in as they are
+      # and the run ends with EXIT_INCOMPLETE. Nothing is silently dropped -
+      # both sides are in the commit - but it has to be fixed up by hand.
+      warn "Commit ${CMT_SHORT}: -c force, committing the conflict markers as they are;"
+      warn "  the result will not build until they are resolved by hand."
+      CONFLICTS_COMMITTED=1
+      git add -u >> "${LOG_FILE}" 2>&1 || true
+    fi
   fi
 
   if [[ "${SKIP_COMMIT}" != 0 ]]; then
@@ -835,9 +1025,13 @@ for CMT in "${COMMITS[@]}"; do
     if git commit --author="${MESSAGE_AUTHOR}" -m "${MESSAGE_NEW}" >> "${LOG_FILE}" 2>&1; then
       ((SERIE_CNTR++))
       LAST_PORTED="${CMT}"
-      if [[ "${ANYTHING_REJECTED}" != 0 ]]; then
-        ((PARTIAL_CNTR++))
-        warn "Commit ${CMT}: committed with rejected hunks - review it before sending."
+      if [[ "${ANYTHING_CONFLICTED}" != 0 ]]; then
+        ((CONFLICTED_CNTR++))
+        if [[ "${CONFLICTS_COMMITTED}" != 0 ]]; then
+          warn "Commit ${CMT}: committed with conflict markers - it will not build."
+        else
+          warn "Commit ${CMT}: committed with a hand-resolved conflict - review it before sending."
+        fi
       fi
       info "Commit ${CMT}: ported and committed to '${BRANCH_NAME}'."
     else
@@ -858,10 +1052,10 @@ if [[ "${BRANCH_EXISTED}" -eq 1 ]]; then
 else
   BRANCH_STATE="created"
 fi
-info "Branch '${BRANCH_NAME}' ${BRANCH_STATE} in ${KERNEL_DIR}. Processed ${#COMMITS[@]} commit(s) from ACPICA, ported ${SERIE_CNTR}, skipped ${SKIPPED_CNTR}, partial ${PARTIAL_CNTR}, failed ${FAILED_CNTR}."
+info "Branch '${BRANCH_NAME}' ${BRANCH_STATE} in ${KERNEL_DIR}. Processed ${#COMMITS[@]} commit(s) from ACPICA, ported ${SERIE_CNTR}, skipped ${SKIPPED_CNTR}, conflicted ${CONFLICTED_CNTR}, failed ${FAILED_CNTR}."
 info "Log: ${LOG_FILE}"
 
-if (( SKIPPED_CNTR > 0 || PARTIAL_CNTR > 0 || FAILED_CNTR > 0 )); then
+if (( SKIPPED_CNTR > 0 || CONFLICTED_CNTR > 0 || FAILED_CNTR > 0 )); then
   exit ${EXIT_INCOMPLETE}
 fi
 
